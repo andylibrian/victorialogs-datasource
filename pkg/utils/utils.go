@@ -1,3 +1,24 @@
+// utils.go — Shared Utility Functions
+//
+// This file provides helpers used across the plugin backend:
+//   - Time parsing: converting many timestamp formats to Go time.Time
+//   - Template variable substitution: replacing $__interval, $__range, etc.
+//   - Step/interval calculation: computing appropriate query resolution
+//   - LogsQL expression manipulation: adding _time filters to stats queries
+//
+// TIME FORMAT SUPPORT:
+// VictoriaLogs accepts timestamps in many formats (see ParseTimeAt). The plugin
+// must handle all of them because:
+//   - Grafana sends start/end as Unix milliseconds or RFC3339 strings
+//   - Users can type literal times like "2024-01-01" or "now-1h" into query fields
+//   - VictoriaLogs' own _time field uses RFC3339Nano
+//
+// STEP / INTERVAL CALCULATION:
+// For time-series queries, we must decide how many data points to return.
+// Grafana tells us MaxDataPoints (panel width in pixels) and IntervalMs.
+// CalculateStep divides the time range by MaxDataPoints and then snaps the
+// result to a "nice" human-readable value (see roundInterval).
+
 package utils
 
 import (
@@ -13,31 +34,55 @@ import (
 	"github.com/grafana/grafana-plugin-sdk-go/backend/gtime"
 )
 
+// Grafana template variable placeholders that appear in LogsQL expressions.
+// These are replaced with computed values at query time (see ReplaceTemplateVariable).
 const (
-	varInterval   = "$__interval"
-	varIntervalMs = "$__interval_ms"
-	varRange      = "$__range"
+	varInterval   = "$__interval"    // Human-readable interval, e.g. "15s"
+	varIntervalMs = "$__interval_ms" // Interval in milliseconds as an integer string
+	varRange      = "$__range"       // Full time range as a LogsQL range literal
+)
 
-	timeField = "_time"
+// timeField is the VictoriaLogs reserved field name for the log timestamp.
+// It is used as a filter prefix in stats queries: _time:[start, end].
+const timeField = "_time"
 
+// Nanosecond constants for timezone offset arithmetic.
+// Using explicit nanosecond values avoids repeated multiplication in hot paths.
+const (
 	nsecsPerHour   = 3600 * 1e9
 	nsecsPerMinute = 60 * 1e9
 )
 
 var (
+	// defaultResolution is the fallback number of data points when Grafana
+	// does not specify MaxDataPoints. 1500 matches Grafana's default panel width,
+	// giving roughly one data point per pixel on a typical display.
 	defaultResolution int64 = 1500
-	year                    = time.Hour * 24 * 365
-	day                     = time.Hour * 24
+
+	// year and day are used in formatDuration to produce human-readable interval strings.
+	year = time.Hour * 24 * 365
+	day  = time.Hour * 24
 )
 
 const (
-	// These values prevent from overflow when storing msec-precision time in int64.
-	minTimeNsecs = 0 // use 0 instead of `int64(-1<<63) / 1e6` because the storage engine doesn't actually support negative time
+	// Nanosecond bounds for safe int64 time storage.
+	// minTimeNsecs is 0 (not the mathematical minimum of int64) because VictoriaLogs'
+	// storage engine does not support negative timestamps (pre-1970 times).
+	// maxTimeNsecs is int64 max, which corresponds to the year ~2262.
+	minTimeNsecs = 0
 	maxTimeNsecs = int64(1<<63 - 1)
+	// maxTimeMsecs is used when converting millisecond-precision timestamps that
+	// might overflow if naively multiplied to nanoseconds.
 	maxTimeMsecs = maxTimeNsecs / 1e6
 )
 
-// GetTime  returns time from the given string.
+// GetTime parses a timestamp string into a Go time.Time.
+//
+// It tries RFC3339Nano first (the native VictoriaLogs _time format) for performance.
+// If that fails, it falls back to ParseTime which handles a wide range of formats
+// (see ParseTimeAt). The result is clamped to [0, maxTimeNsecs] to prevent overflow.
+//
+// All times are returned in UTC for consistency across timezones.
 func GetTime(s string) (time.Time, error) {
 	if nsecs, ok := TryParseTimestampRFC3339Nano(s); ok {
 		if nsecs < minTimeNsecs {
@@ -49,10 +94,14 @@ func GetTime(s string) (time.Time, error) {
 		return time.Unix(0, nsecs).UTC(), nil
 	}
 
+	// Fall back to the more general parser which handles Unix timestamps,
+	// truncated ISO dates (YYYY, YYYY-MM, etc.), and relative expressions like "now-1h".
 	secs, err := ParseTime(s)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("cannot parse %s: %w", s, err)
 	}
+	// Convert seconds to milliseconds, then clamp before multiplying to nanoseconds
+	// to avoid int64 overflow with very large timestamps.
 	msecs := int64(secs * 1e3)
 	if msecs < minTimeNsecs {
 		msecs = 0
@@ -83,6 +132,16 @@ const (
 // ParseTimeAt parses time s in different formats, assuming the given currentTimestamp.
 //
 // See https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#timestamp-formats
+//
+// WHY so many format checks?
+// VictoriaLogs is flexible about what timestamps users can type. Supporting truncated
+// ISO dates (just YYYY, or YYYY-MM) lets users write readable queries like
+//   _time:[2024-01-01, 2024-02-01]
+// without specifying the full RFC3339 timestamp.
+//
+// The format selection is done by string length because it is unambiguous:
+// date strings of the same format always have the same length. This is faster
+// than trying multiple formats with time.Parse and discarding parse errors.
 //
 // It returns unix timestamp in seconds.
 func ParseTimeAt(s string, currentTimestamp float64) (float64, error) {
@@ -137,13 +196,14 @@ func ParseTimeAt(s string, currentTimestamp float64) (float64, error) {
 		return tzOffset + float64(t.UnixNano())/1e9, nil
 	}
 	if !strings.Contains(sOrig, "-") {
-		// Parse the timestamp in seconds or in milliseconds
+		// No dashes → this is a raw Unix timestamp (seconds or milliseconds).
 		ts, err := strconv.ParseFloat(sOrig, 64)
 		if err != nil {
 			return 0, err
 		}
+		// Heuristic: values >= 2^32 (~4.3 billion) can't be Unix seconds in the
+		// year 2024 (which is ~1.7 billion), so they must be milliseconds.
 		if ts >= (1 << 32) {
-			// The timestamp is in milliseconds. Convert it to seconds.
 			ts /= 1000
 		}
 		return ts, nil
@@ -420,7 +480,17 @@ func GetLocalTimezoneOffsetNsecs() int64 {
 	return int64(offset) * 1e9
 }
 
-// ReplaceTemplateVariable get query and use it expression to remove grafana template variables with
+// ReplaceTemplateVariable substitutes Grafana's built-in template variables in
+// a LogsQL expression with computed values.
+//
+// Grafana defines several special variables that users can include in queries:
+//   - $__interval    → human-readable step duration (e.g. "15s", "5m")
+//   - $__interval_ms → same interval as milliseconds integer string (e.g. "15000")
+//   - $__range       → the full query time range as a LogsQL range literal (e.g. "[1704067200, 1704070800]")
+//
+// These variables are replaced at query time so that:
+//   - $__interval aligns the query step with the panel's visual resolution
+//   - $__range allows users to write stats queries that cover exactly the selected time window
 func ReplaceTemplateVariable(expr string, interval int64, timeRange backend.TimeRange) string {
 	expr = strings.ReplaceAll(expr, varRange, timeRangeToString(timeRange))
 	expr = strings.ReplaceAll(expr, varIntervalMs, strconv.FormatInt(interval, 10))
@@ -428,6 +498,9 @@ func ReplaceTemplateVariable(expr string, interval int64, timeRange backend.Time
 	return expr
 }
 
+// formatDuration converts a duration to a VictoriaLogs/Prometheus-style string like "15s", "5m", "1h".
+// The output is used as the $__interval replacement in LogsQL expressions.
+// We use the largest unit that fits exactly to produce the most readable result.
 func formatDuration(inter time.Duration) string {
 	switch {
 	case inter >= year:
@@ -447,12 +520,22 @@ func formatDuration(inter time.Duration) string {
 	}
 }
 
-// GetIntervalFrom returns the minimum interval.
+// GetIntervalFrom returns the minimum interval to use for step calculations.
+//
+// Priority (highest to lowest):
+//  1. queryInterval string (user-set per-query minimum interval), if not "0s"
+//  2. queryIntervalMS (Grafana-calculated based on panel width and time range)
+//  3. dsInterval string (datasource-level minimum interval setting)
+//  4. defaultInterval (hardcoded fallback, currently 15s)
+//
+// The "0s" check is needed because Grafana historically set queryInterval to "0s"
+// when the user leaves the field empty, rather than omitting it entirely.
+//
 // dsInterval is the string representation of data source min interval, if configured.
 // queryInterval is the string representation of query interval (min interval), e.g. "10ms" or "10s".
 // queryIntervalMS is a pre-calculated numeric representation of the query interval in milliseconds.
 func GetIntervalFrom(dsInterval, queryInterval string, queryIntervalMS int64, defaultInterval time.Duration) (time.Duration, error) {
-	// Apparently we are setting default value of queryInterval to 0s now
+	// "0s" is treated as unset — Grafana sends this as the default empty value.
 	interval := queryInterval
 	if interval == "0s" {
 		interval = ""
@@ -477,7 +560,16 @@ func GetIntervalFrom(dsInterval, queryInterval string, queryIntervalMS int64, de
 	return parsedInterval, nil
 }
 
-// CalculateStep calculates step by provided max datapoints and timerange
+// CalculateStep computes the optimal query step (data point interval) for a time range.
+//
+// The step is calculated so that the response contains approximately MaxDataPoints
+// data points. This matches the panel's pixel width, giving one data point per pixel.
+//
+// The raw computed interval is then rounded to a "nice" human-readable value via
+// roundInterval so users see steps like "1m" instead of "73s".
+//
+// The result is never smaller than minInterval, which prevents over-sampling
+// (requesting more data points than the datasource or network can handle).
 func CalculateStep(minInterval time.Duration, timeRange backend.TimeRange, maxDataPoints int64) time.Duration {
 	resolution := maxDataPoints
 	if resolution == 0 {
@@ -495,19 +587,33 @@ func CalculateStep(minInterval time.Duration, timeRange backend.TimeRange, maxDa
 	return roundInterval(calculatedInterval)
 }
 
-// WithIntervalVariable checks if the expression contains interval variable
+// WithIntervalVariable returns true if expr is exactly the $__interval placeholder.
+// When this is the case, the caller replaces it with an empty string so that
+// GetIntervalFrom falls back to the computed intervalMs instead of trying to
+// parse the literal "$__interval" string as a duration.
 func WithIntervalVariable(expr string) bool {
 	return expr == varInterval
 }
 
-// parseIntervalStringToTimeDuration tries to parse interval string to duration representation
+// parseIntervalStringToTimeDuration converts an interval string to time.Duration.
+//
+// WHY strip < and >?
+// Grafana's interval picker produces strings like "<5m" (meaning "at most 5m").
+// We strip the angle brackets because gtime.ParseDuration doesn't understand them,
+// but we still want to use the numeric value.
+//
+// WHY append "s" for pure numbers?
+// A bare number like "15" is interpreted as 15 seconds. This matches Grafana's
+// convention where a numeric-only interval string means seconds.
 func parseIntervalStringToTimeDuration(interval string) (time.Duration, error) {
+	// Strip leading "<" or ">" characters from Grafana's interval picker format.
 	formattedInterval := strings.Replace(strings.Replace(interval, "<", "", 1), ">", "", 1)
 	isPureNum, err := regexp.MatchString(`^\d+$`, formattedInterval)
 	if err != nil {
 		return time.Duration(0), err
 	}
 	if isPureNum {
+		// Treat a bare number as seconds (e.g. "15" → "15s").
 		formattedInterval += "s"
 	}
 	parsedInterval, err := gtime.ParseDuration(formattedInterval)
@@ -517,6 +623,19 @@ func parseIntervalStringToTimeDuration(interval string) (time.Duration, error) {
 	return parsedInterval, nil
 }
 
+// roundInterval snaps a raw calculated interval to a human-friendly "nice" value.
+//
+// WHY round intervals?
+// CalculateStep divides the time range by MaxDataPoints, which yields arbitrary values
+// like 73 seconds or 412 milliseconds. Displaying a graph with "73s" steps is confusing;
+// users expect to see round numbers like "1m" or "30s".
+//
+// The breakpoints are chosen so that each bucket covers values up to the midpoint
+// between two adjacent steps. For example:
+//   - < 1.5s → snap to 1s
+//   - 1.5s–3.5s → snap to 2s
+//   - 3.5s–7.5s → snap to 5s
+// This ensures consistent, predictable rounding regardless of input.
 func roundInterval(interval time.Duration) time.Duration {
 	switch {
 	case interval <= 10*time.Millisecond:
@@ -613,17 +732,41 @@ func roundInterval(interval time.Duration) time.Duration {
 	}
 }
 
-// Regex to find options(...) and insert time field after the closing parenthesis
+// optionRe matches a VictoriaLogs LogsQL options(...) clause so we can insert
+// the time range filter in the correct position (after options, not at the start).
+// Example expression: `count() by (app) options(skip_empty_values=true)`
 var (
 	optionRe = regexp.MustCompile(`(options\s*\(.*?\))(\s*|$)`)
 )
 
-// AddTimeFieldWithRange adds time field with range to the query
+// AddTimeFieldWithRange injects a _time:[start, end] filter into a LogsQL stats expression
+// when one is not already present.
+//
+// WHY do we need this?
+// The /stats_query endpoint uses a single "time" parameter (point-in-time) rather than
+// "start"/"end". To restrict which logs are included in the aggregation, we embed the
+// time range directly inside the LogsQL expression using the _time filter.
+// Without this, a query like `count()` would aggregate ALL logs ever stored.
+//
+// WHY check for options() block?
+// The LogsQL options(...) clause must appear at the end of the filter part (before pipes).
+// We insert _time AFTER options() to preserve valid syntax:
+//   BEFORE: count() by (app) options(skip_empty_values=true)
+//   AFTER:  count() by (app) options(skip_empty_values=true) _time:[start, end]
+// Without this handling, we'd prepend _time before options(), which is also valid but
+// placing it after options() is more readable and follows VictoriaLogs conventions.
+//
+// If no options() block is present, we prepend _time at the beginning:
+//   BEFORE: count() by (app)
+//   AFTER:  _time:[start, end] count() by (app)
 func AddTimeFieldWithRange(expr string, timeRange backend.TimeRange) string {
 	if expr == "" {
 		return expr
 	}
 
+	// Skip if the user already included _time in their expression.
+	// We only look at the filter part (before any | pipe) to avoid false matches
+	// in pipe arguments.
 	if hasTimeField(expr) {
 		return expr
 	}
@@ -634,17 +777,24 @@ func AddTimeFieldWithRange(expr string, timeRange backend.TimeRange) string {
 	expr = strings.TrimSpace(expr)
 
 	if optionRe.MatchString(expr) {
+		// Insert _time after the options() clause to preserve valid syntax.
 		return optionRe.ReplaceAllString(expr, fmt.Sprintf("$1 %s$2", timeFieldWithRange))
 	}
 
-	// No options block, add time field at the beginning
+	// No options block; prepend _time to the expression.
 	return fmt.Sprintf("%s %s", timeFieldWithRange, expr)
 }
 
+// timeRangeToString formats a Grafana time range as a LogsQL range literal.
+// The format is [unixSecStart, unixSecEnd], which VictoriaLogs uses in _time filters.
 func timeRangeToString(timeRange backend.TimeRange) string {
 	return fmt.Sprintf("[%s, %s]", strconv.FormatInt(timeRange.From.Unix(), 10), strconv.FormatInt(timeRange.To.Unix(), 10))
 }
 
+// hasTimeField reports whether a LogsQL expression already contains a _time filter.
+// We only inspect the filter part of the expression (before the first | pipe character)
+// because pipe arguments may legitimately contain the string "_time:" without being
+// the time filter (e.g. in field rename operations or format strings).
 func hasTimeField(expr string) bool {
 	parts := strings.Split(expr, "|")
 	if len(parts) > 1 {
