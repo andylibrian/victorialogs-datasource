@@ -10,6 +10,7 @@ If you encounter unfamiliar terms, see the [Glossary](./glossary.md).
 
 - [Overview](#overview)
 - [Plugin Entry Point](#plugin-entry-point)
+- [Grafana Plugin / Datasource Internals Context](#grafana-plugin--datasource-internals-context)
 - [Datasource and Instance Management](#datasource-and-instance-management)
 - [HTTP Route Registration](#http-route-registration)
 - [Query Execution — QueryData](#query-execution--querydata)
@@ -68,6 +69,73 @@ func main() {
 ```
 
 `backend.Manage()` starts the gRPC server that Grafana communicates with. The single `Datasource` struct implements all four handler interfaces.
+
+## Grafana Plugin / Datasource Internals Context
+
+This section explains how Grafana core reaches this backend and how SDK protocol pieces fit together.
+
+### End-to-end query path (frontend -> Grafana core -> plugin process)
+
+For backend datasource plugins, the frontend usually extends `DataSourceWithBackend` (`grafana/packages/grafana-runtime/src/utils/DataSourceWithBackend.ts`):
+
+1. Frontend `query()` sends `POST /api/ds/query?ds_type=<type>`.
+2. Grafana API receives it in `grafana/pkg/api/ds_query.go` (`QueryMetricsV2`).
+3. Query service parses/groups queries in `grafana/pkg/services/query/query.go`.
+4. Plugin client dispatches through `grafana/pkg/plugins/manager/client/client.go`.
+5. gRPC bridge calls plugin process via `grafana/pkg/plugins/backendplugin/grpcplugin/client_v2.go`.
+6. SDK adapter invokes this plugin's `QueryData` handler.
+
+For resource calls (`getResource`/`postResource` in frontend), Grafana routes through `/api/datasources/uid/:uid/resources/...` and reaches `CallResource`.
+
+For health checks (`Save & Test`), Grafana calls `/api/datasources/uid/:uid/health` and reaches `CheckHealth`.
+
+### Protocol services and handler mapping
+
+The protocol contract lives in `grafana-plugin-sdk-go/proto/backend.proto`:
+
+- `service Data` -> `QueryData`, `QueryChunkedData`
+- `service Resource` -> `CallResource`
+- `service Diagnostics` -> `CheckHealth`
+- `service Stream` -> `SubscribeStream`, `RunStream`, `PublishStream`
+
+`backend.Manage(..., backend.ServeOpts{...})` wires your Go handlers into those gRPC services through SDK adapters (`grafana-plugin-sdk-go/backend/serve.go`, `.../backend/grpcplugin/serve.go`).
+
+### PluginContext and datasource settings propagation
+
+Every gRPC request carries `PluginContext` (`backend.proto`) including:
+
+- org/user info
+- plugin ID/version
+- datasource instance settings (`jsonData`, decrypted secure fields, UID, etc.)
+
+The SDK converts protocol payloads to Go structs in `grafana-plugin-sdk-go/backend/convert_from_protobuf.go`, then your handler receives `backend.PluginContext`/`backend.DataSourceInstanceSettings`.
+
+This is why `getInstance(ctx, req.PluginContext)` in this plugin can create/cache per-datasource instances correctly.
+
+### Data frame transport (Go <-> frontend)
+
+Backend responses are `backend.QueryDataResponse` (`grafana-plugin-sdk-go/backend/data.go`) with `map[refId]DataResponse`.
+
+Frame encoding across process boundary:
+
+- Go -> protocol: `convert_to_protobuf.go` (`QueryDataResponse`)
+- protocol -> Go: `convert_from_protobuf.go`
+- wire formats: Arrow or JSON (`DataFrameFormat`)
+- Arrow encode/decode: `grafana-plugin-sdk-go/data/arrow.go`
+
+Frontend decoding path:
+
+- `toDataQueryResponse()` in `grafana/packages/grafana-runtime/src/utils/queryResponse.ts`
+- frame model in `grafana/packages/grafana-data/src/types/dataFrame.ts`
+
+### Streaming in core vs plugin
+
+Streaming has two separate mechanisms in Grafana:
+
+1. `DataSourceWithBackend` streaming via returned frames with `meta.channel`, then frontend switches to live subscription (`toStreamingDataResponse()`).
+2. Explore live-tail flows that set `DataQueryRequest.liveStreaming` and let datasource/plugin-specific code manage stream behavior.
+
+This plugin's backend stream handlers (`SubscribeStream`, `RunStream`, `PublishStream`) implement the protocol expected by Grafana Live and are backed by VictoriaLogs `/select/logsql/tail`.
 
 ## Datasource and Instance Management
 

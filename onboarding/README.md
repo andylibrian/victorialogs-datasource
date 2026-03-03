@@ -27,6 +27,13 @@ A hybrid TypeScript (frontend) + Go (backend) Grafana datasource plugin that con
 - Then learn the LogsQL handling details (parsing, variables, filters).
 - Finish with practical dev setup so you can build and run locally.
 
+## Platform Deep Dives (@grafana/)
+
+After the core plugin docs, continue with these codebase deep dives:
+
+1. [`onboarding-grafana-plugin-sdk.md`](./onboarding-grafana-plugin-sdk.md) — `DataSourceWithBackend`, plugin protocol, data frame transport
+2. [`onboarding-grafana-explore-internals.md`](./onboarding-grafana-explore-internals.md) — supplementary queries, log context, and live streaming internals
+
 ## Role-Based Shortcuts
 
 ### Frontend-focused (TypeScript/React)
@@ -102,3 +109,7 @@ After finishing the onboarding docs, explore these areas:
 3. **Grafana Explore internals** — how supplementary queries, log context, and live streaming work
 4. **Multi-tenancy patterns** — how AccountID/ProjectID headers scope data access
 5. **Testing patterns** — how mocks and test utilities are structured in both frontend and backend
+
+If you want these topics in guided form, use:
+- [`onboarding-grafana-plugin-sdk.md`](./onboarding-grafana-plugin-sdk.md)
+- [`onboarding-grafana-explore-internals.md`](./onboarding-grafana-explore-internals.md)
